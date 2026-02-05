@@ -6,7 +6,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
+from decimal import Decimal
 import threading
 
 # ============================================
@@ -23,11 +24,10 @@ DB_PARAMS = {
 # ============================================
 # CONFIGURACIÓN DE SIMULACIÓN
 # ============================================
-INTERVALO_PRODUCCION = 5  # segundos entre cada producto
-TASA_DEFECTOS = 0.04  # 4% de defectos
-MAX_REINTENTOS_CONEXION = 10  # Reintentos de conexión inicial
+INTERVALO_PRODUCCION = 5
+TASA_DEFECTOS = 0.04
+MAX_REINTENTOS_CONEXION = 10
 
-# Rangos de parámetros de máquina
 TEMP_RANGE = (65, 85)
 HUMEDAD_RANGE = (40, 60)
 VELOCIDAD_RANGE = (80, 120)
@@ -51,7 +51,7 @@ def log_mensaje(mensaje, tipo="INFO"):
     sys.stdout.flush()
 
 def esperar_postgres():
-    """Espera a que PostgreSQL esté listo antes de continuar"""
+    """Espera a que PostgreSQL esté listo"""
     log_mensaje("Esperando a que PostgreSQL esté listo...", "INFO")
     
     for intento in range(1, MAX_REINTENTOS_CONEXION + 1):
@@ -60,25 +60,23 @@ def esperar_postgres():
             conn.close()
             log_mensaje("PostgreSQL está listo!", "SUCCESS")
             return True
-        except psycopg2.OperationalError as e:
+        except psycopg2.OperationalError:
             log_mensaje(f"Intento {intento}/{MAX_REINTENTOS_CONEXION} - PostgreSQL no está listo aún...", "WARNING")
             if intento < MAX_REINTENTOS_CONEXION:
                 time.sleep(5)
-            else:
-                log_mensaje(f"No se pudo conectar a PostgreSQL después de {MAX_REINTENTOS_CONEXION} intentos", "ERROR")
-                log_mensaje(f"Error: {e}", "ERROR")
-                return False
+    
+    log_mensaje(f"No se pudo conectar a PostgreSQL después de {MAX_REINTENTOS_CONEXION} intentos", "ERROR")
     return False
 
 def obtener_turno_actual():
     """Determina el turno basado en la hora actual"""
     hora = datetime.now().hour
     if 6 <= hora < 14:
-        return 1  # Mañana
+        return 1
     elif 14 <= hora < 22:
-        return 2  # Tarde
+        return 2
     else:
-        return 3  # Noche
+        return 3
 
 def generar_codigo_operador():
     """Genera un código de operador aleatorio"""
@@ -86,13 +84,21 @@ def generar_codigo_operador():
 
 def calcular_peso_real(peso_objetivo, tolerancia):
     """Genera un peso real con distribución normal"""
-    desviacion = tolerancia / 3
-    peso = random.gauss(peso_objetivo, desviacion)
+    # ✅ CORRECCIÓN: Convertir Decimal a float
+    peso_obj = float(peso_objetivo)
+    tol = float(tolerancia)
+    
+    desviacion = tol / 3
+    peso = random.gauss(peso_obj, desviacion)
     return round(peso, 2)
 
 def es_defecto(peso_real, peso_objetivo, tolerancia):
     """Determina si un bulto es defecto"""
-    if abs(peso_real - peso_objetivo) > tolerancia:
+    # ✅ CORRECCIÓN: Convertir Decimal a float
+    peso_obj = float(peso_objetivo)
+    tol = float(tolerancia)
+    
+    if abs(peso_real - peso_obj) > tol:
         return True
     return random.random() < TASA_DEFECTOS
 
@@ -108,24 +114,21 @@ class SimuladorMaquina:
         self.pais = maquina_data['pais']
         self.productos = productos_permitidos
         
-        # Parámetros operativos "estables" de la máquina
         self.temp_base = random.uniform(*TEMP_RANGE)
         self.humedad_base = random.uniform(*HUMEDAD_RANGE)
         self.velocidad_base = random.randint(*VELOCIDAD_RANGE)
         
-        # Contador de productos
         self.productos_generados = 0
         
     def simular_produccion(self, conn):
         """Simula la producción de un bulto"""
         try:
             # Seleccionar producto según probabilidades
-            producto = random.choices(
-                self.productos,
-                weights=[p['probabilidad'] for p in self.productos]
-            )[0]
+            # ✅ CORRECCIÓN: Convertir probabilidades Decimal a float
+            pesos = [float(p['probabilidad']) for p in self.productos]
+            producto = random.choices(self.productos, weights=pesos)[0]
             
-            # Generar peso real
+            # Generar peso real (ya convierte a float internamente)
             peso_real = calcular_peso_real(
                 producto['peso_objetivo'],
                 producto['tolerancia']
@@ -138,7 +141,7 @@ class SimuladorMaquina:
                 producto['tolerancia']
             ) else 'OK'
             
-            # Parámetros de máquina con variación leve
+            # Parámetros de máquina
             temperatura = round(self.temp_base + random.uniform(-2, 2), 1)
             humedad = round(self.humedad_base + random.uniform(-3, 3), 1)
             velocidad = self.velocidad_base + random.randint(-5, 5)
@@ -170,8 +173,9 @@ class SimuladorMaquina:
             
             # Log de actividad
             icono = "✅" if estado == "OK" else "❌"
+            producto_nombre = producto['nombre'][:30]
             log_mensaje(
-                f"{icono} [{self.pais}] {self.codigo} | {producto['nombre'][:30]} | {peso_real}kg | {estado} | Total: {self.productos_generados}",
+                f"{icono} [{self.pais}] {self.codigo} | {producto_nombre} | {peso_real}kg | {estado} | Total: {self.productos_generados}",
                 "OK" if estado == "OK" else "WARNING"
             )
             
@@ -182,6 +186,8 @@ class SimuladorMaquina:
             return False
         except Exception as e:
             log_mensaje(f"Error inesperado en {self.codigo}: {e}", "ERROR")
+            import traceback
+            traceback.print_exc()
             return False
 
 # ============================================
@@ -194,7 +200,6 @@ def cargar_configuracion(conn):
     
     log_mensaje("Cargando configuración de máquinas...", "INFO")
     
-    # Obtener todas las máquinas
     cur.execute("""
         SELECT 
             m.id, m.codigo, m.modelo,
@@ -212,7 +217,6 @@ def cargar_configuracion(conn):
     simuladores = []
     
     for maq in maquinas:
-        # Obtener productos de la máquina
         cur.execute("""
             SELECT 
                 pr.id, pr.codigo, pr.nombre, pr.peso_objetivo, 
@@ -237,22 +241,16 @@ def cargar_configuracion(conn):
 
 def ejecutar_maquina(simulador, conn_params):
     """Ejecuta la simulación de una máquina en un thread separado"""
-    log_mensaje(f"Iniciando thread para {simulador.codigo}", "INFO")
-    
-    # Cada thread tiene su propia conexión
     conn = None
     intentos_reconexion = 0
     max_intentos = 5
     
     while True:
         try:
-            # Conectar si no hay conexión
             if conn is None or conn.closed:
-                log_mensaje(f"Conectando {simulador.codigo} a la BD...", "INFO")
                 conn = psycopg2.connect(**conn_params)
                 intentos_reconexion = 0
             
-            # Simular producción
             exito = simulador.simular_produccion(conn)
             
             if not exito:
@@ -265,7 +263,6 @@ def ejecutar_maquina(simulador, conn_params):
                     intentos_reconexion = 0
                     time.sleep(10)
             
-            # Variación aleatoria en el tiempo
             time.sleep(INTERVALO_PRODUCCION + random.uniform(-1, 1))
             
         except psycopg2.OperationalError as e:
@@ -289,25 +286,21 @@ def main():
     log_mensaje(f"📊 Tasa de defectos: {TASA_DEFECTOS*100}%", "INFO")
     print("=" * 80 + "\n")
     
-    # Esperar a PostgreSQL
     if not esperar_postgres():
         log_mensaje("No se pudo conectar a PostgreSQL. Abortando.", "ERROR")
         sys.exit(1)
     
-    # Conectar a la base de datos
     try:
         log_mensaje("Conectando a PostgreSQL...", "INFO")
         conn = psycopg2.connect(**DB_PARAMS)
         log_mensaje("Conexión exitosa!", "SUCCESS")
         
-        # Verificar que las tablas existen
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM produccion_global")
         count = cur.fetchone()[0]
         log_mensaje(f"Registros actuales en produccion_global: {count}", "INFO")
         cur.close()
         
-        # Cargar configuración
         simuladores = cargar_configuracion(conn)
         log_mensaje(f"✅ {len(simuladores)} máquinas cargadas y listas", "SUCCESS")
         
@@ -316,7 +309,6 @@ def main():
             conn.close()
             sys.exit(1)
         
-        # Mostrar resumen
         print("\n" + "=" * 80)
         log_mensaje("🏭 RESUMEN DE PLANTAS ACTIVAS:", "INFO")
         print("=" * 80)
@@ -335,7 +327,6 @@ def main():
         
         conn.close()
         
-        # Crear y lanzar threads
         threads = []
         for simulador in simuladores:
             thread = threading.Thread(
@@ -349,7 +340,6 @@ def main():
         
         log_mensaje("💡 Presiona Ctrl+C para detener la simulación\n", "INFO")
         
-        # Mantener el programa corriendo
         while True:
             time.sleep(1)
             
